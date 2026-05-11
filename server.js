@@ -35,7 +35,7 @@ app.post('/api/create-payment', async (req, res) => {
   const usdAmount = originalCurrency === 'EUR' ? (parseFloat(amount) * 1.17).toFixed(2) : amount;
   
   const paymentData = {
-    returnUrl: `${YOUR_DOMAIN}/payment-success?order=${extOrderId}`,
+    returnUrl: `${YOUR_DOMAIN}/#/payment-success?order=${extOrderId}`,
     extOrderId: String(extOrderId),
     email: email,
     description: "CV Optimization",
