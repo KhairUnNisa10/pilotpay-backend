@@ -7,16 +7,18 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// SANDBOX CONFIGURATION - For testing on live domain
 const PILOTPAY_CONFIG = {
-  apiKey: 'ppk_Zf3GX-MhrqR-nOJitVB2b2ZWvBTYjYe9z0lGsuk7CC0',
-  baseUrl: 'https://sandbox.pilotpay.io/api/v1/core',
+  apiKey: 'ppk_Zf3GX-MhrqR-nOJitVB2b2ZWvBTYjYe9z0lGsuk7CC0', // Keep sandbox key for testing
+  baseUrl: 'https://sandbox.pilotpay.io/api/v1/core', // Keep sandbox URL
   isSandbox: true
 };
 
-const YOUR_DOMAIN = process.env.DOMAIN_URL || 'http://airesumerefine.com/staging';
+// YOUR LIVE DOMAIN (no /staging, but still testing sandbox)
+const YOUR_DOMAIN = process.env.DOMAIN_URL || 'https://airesumerefine.com';
 
 app.post('/api/create-payment', async (req, res) => {
-  console.log('Received Direct API request:', req.body);
+  console.log('Received Direct API request (SANDBOX MODE):', req.body);
   
   const {
     extOrderId,
@@ -32,10 +34,11 @@ app.post('/api/create-payment', async (req, res) => {
     billingAddress
   } = req.body;
 
+  // Convert to USD if needed (using fixed rate for sandbox)
   const usdAmount = originalCurrency === 'EUR' ? (parseFloat(amount) * 1.17).toFixed(2) : amount;
   
   const paymentData = {
-    returnUrl: `${YOUR_DOMAIN}/#/payment-success?order=${extOrderId}`,
+    returnUrl: `${YOUR_DOMAIN}/payment-success?order=${extOrderId}`,
     extOrderId: String(extOrderId),
     email: email,
     description: "CV Optimization",
@@ -75,10 +78,10 @@ app.post('/api/create-payment', async (req, res) => {
       }
     );
 
-    console.log('✅ PilotPay Direct API Success:', response.status);
+    console.log('✅ PilotPay Sandbox Success:', response.status);
     console.log('Response:', JSON.stringify(response.data, null, 2));
     
-    // Extract redirect URL from the response (important for 3DS)
+    // Extract redirect URL from the response
     let redirectUrl = null;
     if (response.data.context?.paymentDetails?.url) {
       redirectUrl = response.data.context.paymentDetails.url;
@@ -88,7 +91,6 @@ app.post('/api/create-payment', async (req, res) => {
       redirectUrl = response.data.redirectUrl;
     }
     
-    // For Direct API, check if there's a redirect or immediate success
     if (redirectUrl) {
       // 3DS redirect required
       res.json({
@@ -115,7 +117,7 @@ app.post('/api/create-payment', async (req, res) => {
     }
     
   } catch (error) {
-    console.error('❌ PilotPay Error:', error.response?.status);
+    console.error('❌ PilotPay Sandbox Error:', error.response?.status);
     console.error('Error Data:', JSON.stringify(error.response?.data, null, 2));
     
     if (error.response?.data?.errors) {
@@ -149,8 +151,11 @@ app.get('/api/payment-status/:paymentId', async (req, res) => {
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`========================================`);
-  console.log(`✅ PilotPay Direct API Backend Running`);
+  console.log(`✅ PilotPay Backend Running (SANDBOX MODE - Testing on Live Domain)`);
   console.log(`   Port: ${PORT}`);
-  console.log(`   Endpoint: ${PILOTPAY_CONFIG.baseUrl}/payment`);
+  console.log(`   Environment: SANDBOX (testing only - no real charges)`);
+  console.log(`   Domain: ${YOUR_DOMAIN}`);
+  console.log(`   API URL: ${PILOTPAY_CONFIG.baseUrl}/payment`);
+  console.log(`   ⚠️  Using test card numbers only!`);
   console.log(`========================================`);
 });
