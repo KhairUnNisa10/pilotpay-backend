@@ -34,7 +34,6 @@ app.post('/api/create-payment', async (req, res) => {
 
   const usdAmount = originalCurrency === 'EUR' ? (parseFloat(amount) * 1.17).toFixed(2) : amount;
   
-  // CORRECT ENDPOINT: /payment (not /gateway/.../payment)
   const paymentData = {
     returnUrl: `${YOUR_DOMAIN}/payment-success?order=${extOrderId}`,
     extOrderId: String(extOrderId),
@@ -44,7 +43,7 @@ app.post('/api/create-payment', async (req, res) => {
     amount: usdAmount,
     currency: "USD",
     type: "fiat",
-    method: "card",  // For card payments
+    method: "card",
     additions: {
       email: email,
       card_number: cardNumber.replace(/\s/g, ''),
@@ -63,7 +62,6 @@ app.post('/api/create-payment', async (req, res) => {
   const uniqueRequestId = crypto.randomUUID();
 
   try {
-    // CORRECT URL: /payment (not /gateway/.../payment)
     const response = await axios.post(
       `${PILOTPAY_CONFIG.baseUrl}/payment`,
       paymentData,
@@ -78,15 +76,25 @@ app.post('/api/create-payment', async (req, res) => {
     );
 
     console.log('✅ PilotPay Direct API Success:', response.status);
-    console.log('Response:', response.data);
+    console.log('Response:', JSON.stringify(response.data, null, 2));
+    
+    // Extract redirect URL from the response (important for 3DS)
+    let redirectUrl = null;
+    if (response.data.context?.paymentDetails?.url) {
+      redirectUrl = response.data.context.paymentDetails.url;
+    } else if (response.data.context?.redirectUrl) {
+      redirectUrl = response.data.context.redirectUrl;
+    } else if (response.data.redirectUrl) {
+      redirectUrl = response.data.redirectUrl;
+    }
     
     // For Direct API, check if there's a redirect or immediate success
-    if (response.data.context?.redirectUrl) {
+    if (redirectUrl) {
       // 3DS redirect required
       res.json({
         success: true,
         requiresRedirect: true,
-        redirectUrl: response.data.context.redirectUrl,
+        redirectUrl: redirectUrl,
         paymentId: response.data.shortId
       });
     } else if (response.data.status === 'SUCCESS') {
@@ -97,7 +105,7 @@ app.post('/api/create-payment', async (req, res) => {
         paymentId: response.data.shortId
       });
     } else {
-      // Payment is processing
+      // Payment is processing - poll for status
       res.json({
         success: true,
         paymentId: response.data.shortId,
@@ -126,7 +134,6 @@ app.get('/api/payment-status/:paymentId', async (req, res) => {
   const { paymentId } = req.params;
   
   try {
-    // Correct URL for status check
     const response = await axios.get(
       `${PILOTPAY_CONFIG.baseUrl}/payment/${paymentId}`,
       { headers: { 'api-key': PILOTPAY_CONFIG.apiKey } }
