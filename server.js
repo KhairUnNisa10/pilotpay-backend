@@ -4,14 +4,11 @@ const cors = require('cors');
 const crypto = require('crypto');
 
 const app = express();
-
-// Allow all origins for testing (you can restrict later)
 app.use(cors());
 app.use(express.json());
 
 const PILOTPAY_CONFIG = {
   apiKey: 'ppk_Zf3GX-MhrqR-nOJitVB2b2ZWvBTYjYe9z0lGsuk7CC0',
-  gatewayId: 'gwy2BWTrm2zzHV',
   baseUrl: 'https://sandbox.pilotpay.io/api/v1/core',
   isSandbox: true
 };
@@ -37,7 +34,9 @@ app.post('/api/create-payment', async (req, res) => {
 
   const usdAmount = originalCurrency === 'EUR' ? (parseFloat(amount) * 1.17).toFixed(2) : amount;
   
+  // CORRECT ENDPOINT: /payment (not /gateway/.../payment)
   const paymentData = {
+    returnUrl: `${YOUR_DOMAIN}/payment-success?order=${extOrderId}`,
     extOrderId: String(extOrderId),
     email: email,
     description: "CV Optimization",
@@ -45,9 +44,7 @@ app.post('/api/create-payment', async (req, res) => {
     amount: usdAmount,
     currency: "USD",
     type: "fiat",
-    method: "card",
-    successRedirectURL: `${YOUR_DOMAIN}/payment-success?order=${extOrderId}`,
-    failureRedirectURL: `${YOUR_DOMAIN}/payment`,
+    method: "card",  // For card payments
     additions: {
       email: email,
       card_number: cardNumber.replace(/\s/g, ''),
@@ -56,15 +53,19 @@ app.post('/api/create-payment', async (req, res) => {
       card_cvv: cvv,
       first_name: firstName,
       last_name: lastName,
-      billing_country: billingAddress?.country || "US"
+      billing_country: billingAddress?.country || "US",
+      billing_address: billingAddress?.street || "",
+      billing_city: billingAddress?.city || "",
+      billing_zip: billingAddress?.zipCode || ""
     }
   };
 
   const uniqueRequestId = crypto.randomUUID();
 
   try {
+    // CORRECT URL: /payment (not /gateway/.../payment)
     const response = await axios.post(
-      `${PILOTPAY_CONFIG.baseUrl}/gateway/${PILOTPAY_CONFIG.gatewayId}/payment`,
+      `${PILOTPAY_CONFIG.baseUrl}/payment`,
       paymentData,
       {
         headers: {
@@ -76,18 +77,38 @@ app.post('/api/create-payment', async (req, res) => {
       }
     );
 
-    console.log('✅ PilotPay Success:', response.status);
+    console.log('✅ PilotPay Direct API Success:', response.status);
+    console.log('Response:', response.data);
     
-    res.json({
-      success: true,
-      paymentId: response.data.payment?.shortId || response.data.shortId,
-      status: response.data.payment?.status || response.data.status,
-      redirectUrl: response.data.link || null,
-      requiresRedirect: !!response.data.link
-    });
+    // For Direct API, check if there's a redirect or immediate success
+    if (response.data.context?.redirectUrl) {
+      // 3DS redirect required
+      res.json({
+        success: true,
+        requiresRedirect: true,
+        redirectUrl: response.data.context.redirectUrl,
+        paymentId: response.data.shortId
+      });
+    } else if (response.data.status === 'SUCCESS') {
+      // Payment completed immediately
+      res.json({
+        success: true,
+        status: 'SUCCESS',
+        paymentId: response.data.shortId
+      });
+    } else {
+      // Payment is processing
+      res.json({
+        success: true,
+        paymentId: response.data.shortId,
+        status: response.data.status,
+        requiresPolling: true
+      });
+    }
     
   } catch (error) {
     console.error('❌ PilotPay Error:', error.response?.status);
+    console.error('Error Data:', JSON.stringify(error.response?.data, null, 2));
     
     if (error.response?.data?.errors) {
       const errorMessages = error.response.data.errors.map(e => e.message).join(', ');
@@ -105,13 +126,15 @@ app.get('/api/payment-status/:paymentId', async (req, res) => {
   const { paymentId } = req.params;
   
   try {
+    // Correct URL for status check
     const response = await axios.get(
-      `${PILOTPAY_CONFIG.baseUrl}/gateway/${PILOTPAY_CONFIG.gatewayId}/payment/${paymentId}`,
+      `${PILOTPAY_CONFIG.baseUrl}/payment/${paymentId}`,
       { headers: { 'api-key': PILOTPAY_CONFIG.apiKey } }
     );
     
     res.json({ status: response.data.status });
   } catch (error) {
+    console.error('Status check error:', error.message);
     res.status(400).json({ error: 'Failed to fetch payment status' });
   }
 });
@@ -119,7 +142,8 @@ app.get('/api/payment-status/:paymentId', async (req, res) => {
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`========================================`);
-  console.log(`✅ PilotPay Backend Running`);
+  console.log(`✅ PilotPay Direct API Backend Running`);
   console.log(`   Port: ${PORT}`);
+  console.log(`   Endpoint: ${PILOTPAY_CONFIG.baseUrl}/payment`);
   console.log(`========================================`);
 });
