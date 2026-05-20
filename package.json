@@ -22,7 +22,7 @@
     "pdf-decomposer": "^1.2.0",
     "pdf-parse": "^2.4.5",
     "resend": "^6.12.3",
-    "sqlite3": "^6.0.1",
+    "better-sqlite3": "^9.0.0",
     "uuid": "^14.0.0"
   }
 }

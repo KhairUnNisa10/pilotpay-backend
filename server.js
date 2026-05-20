@@ -3,7 +3,7 @@ const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
 const crypto = require('crypto');
-const sqlite3 = require('sqlite3').verbose();
+const Database = require('better-sqlite3');  // ← Changed
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const path = require('path');
@@ -31,6 +31,7 @@ const PILOTPAY_CONFIG = {
 const YOUR_DOMAIN = process.env.DOMAIN_URL || 'https://airesumerefine.com';
 
 app.post('/api/create-payment', async (req, res) => {
+  // ... keep your existing payment code exactly the same ...
   console.log('Received Direct API request:', req.body);
   
   const {
@@ -192,69 +193,58 @@ app.get('/api/payment-status/:paymentId', async (req, res) => {
   }
 });
 
-// Initialize database
-const db = new sqlite3.Database(path.join(__dirname, 'resume_refiner.db'));
+// ============= DATABASE SETUP WITH BETTER-SQLITE3 =============
+const db = new Database(path.join(__dirname, 'resume_refiner.db'));
 
-// Create tables with new schema (no credits, just usage limits)
-db.serialize(() => {
-  db.run(`CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    email TEXT UNIQUE,
-    name TEXT DEFAULT '',
-    password_hash TEXT,
-    plan TEXT,
-    max_optimizations INTEGER DEFAULT 10,
-    optimizations_used INTEGER DEFAULT 0,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )`);
-  
-  db.run(`CREATE TABLE IF NOT EXISTS optimization_history (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
-    original_resume TEXT,
-    job_description TEXT,
-    optimized_resume TEXT,
-    match_score INTEGER,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  )`);
-  
-  // Migrate existing users if needed
-  db.run(`ALTER TABLE users ADD COLUMN name TEXT DEFAULT ''`, (err) => {
-    if (err && !err.message.includes('duplicate')) {
-      console.log('Note: name column may already exist');
-    }
-  });
-  
-  db.run(`ALTER TABLE users ADD COLUMN max_optimizations INTEGER DEFAULT 10`, (err) => {
-    if (err && !err.message.includes('duplicate')) {
-      console.log('Note: max_optimizations column may already exist');
-    }
-  });
-  
-  db.run(`ALTER TABLE users ADD COLUMN optimizations_used INTEGER DEFAULT 0`, (err) => {
-    if (err && !err.message.includes('duplicate')) {
-      console.log('Note: optimizations_used column may already exist');
-    }
-  });
-  
-  // Update existing users based on plan
-  db.run(`UPDATE users SET max_optimizations = 10 WHERE plan = 'basic' AND (max_optimizations IS NULL OR max_optimizations = 0)`);
-  db.run(`UPDATE users SET max_optimizations = 20 WHERE plan = 'advance' AND (max_optimizations IS NULL OR max_optimizations = 0)`);
-  db.run(`UPDATE users SET max_optimizations = 30 WHERE plan = 'top' AND (max_optimizations IS NULL OR max_optimizations = 0)`);
-  db.run(`UPDATE users SET optimizations_used = 0 WHERE optimizations_used IS NULL`);
-  
-  // Create demo user with TOP plan (30 optimizations)
-  db.get(`SELECT * FROM users WHERE email = 'demo@airesumerefine.com'`, (err, user) => {
-    if (!user) {
-      db.run(`INSERT INTO users (email, name, password_hash, plan, max_optimizations, optimizations_used) VALUES (?, ?, ?, ?, ?, ?)`, 
-        ['demo@airesumerefine.com', 'Demo User', 'demo_hash', 'top', 30, 0]);
-      console.log('✅ Demo user created with TOP plan (30 optimizations)');
-    } else {
-      db.run(`UPDATE users SET max_optimizations = 30, plan = 'top' WHERE email = 'demo@airesumerefine.com'`);
-      console.log('✅ Demo user updated with TOP plan (30 optimizations)');
-    }
-  });
-});
+// Create tables (synchronous - no callbacks!)
+db.exec(`CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  email TEXT UNIQUE,
+  name TEXT DEFAULT '',
+  password_hash TEXT,
+  plan TEXT,
+  max_optimizations INTEGER DEFAULT 10,
+  optimizations_used INTEGER DEFAULT 0,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+)`);
+
+db.exec(`CREATE TABLE IF NOT EXISTS optimization_history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER,
+  original_resume TEXT,
+  job_description TEXT,
+  optimized_resume TEXT,
+  match_score INTEGER,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+)`);
+
+// Add columns if they don't exist (try/catch for safety)
+try {
+  db.exec(`ALTER TABLE users ADD COLUMN name TEXT DEFAULT ''`);
+} catch(e) { /* column might already exist */ }
+try {
+  db.exec(`ALTER TABLE users ADD COLUMN max_optimizations INTEGER DEFAULT 10`);
+} catch(e) { /* column might already exist */ }
+try {
+  db.exec(`ALTER TABLE users ADD COLUMN optimizations_used INTEGER DEFAULT 0`);
+} catch(e) { /* column might already exist */ }
+
+// Update existing users based on plan
+db.exec(`UPDATE users SET max_optimizations = 10 WHERE plan = 'basic' AND (max_optimizations IS NULL OR max_optimizations = 0)`);
+db.exec(`UPDATE users SET max_optimizations = 20 WHERE plan = 'advance' AND (max_optimizations IS NULL OR max_optimizations = 0)`);
+db.exec(`UPDATE users SET max_optimizations = 30 WHERE plan = 'top' AND (max_optimizations IS NULL OR max_optimizations = 0)`);
+db.exec(`UPDATE users SET optimizations_used = 0 WHERE optimizations_used IS NULL`);
+
+// Create or update demo user
+const demoUser = db.prepare(`SELECT * FROM users WHERE email = 'demo@airesumerefine.com'`).get();
+if (!demoUser) {
+  db.prepare(`INSERT INTO users (email, name, password_hash, plan, max_optimizations, optimizations_used) VALUES (?, ?, ?, ?, ?, ?)`).run(
+    'demo@airesumerefine.com', 'Demo User', 'demo_hash', 'top', 30, 0);
+  console.log('✅ Demo user created with TOP plan (30 optimizations)');
+} else {
+  db.prepare(`UPDATE users SET max_optimizations = 30, plan = 'top' WHERE email = 'demo@airesumerefine.com'`).run();
+  console.log('✅ Demo user updated with TOP plan (30 optimizations)');
+}
 
 const JWT_SECRET = process.env.JWT_SECRET || 'your_super_secret_key_change_this_to_something_random';
 
@@ -344,28 +334,28 @@ app.get('/api/plan-limits', (req, res) => {
 // ============= DEMO LOGIN =============
 app.post('/api/demo-login', async (req, res) => {
   try {
-    db.get(`SELECT id, email, name, plan, max_optimizations, optimizations_used,
-                   (max_optimizations - optimizations_used) as remaining_optimizations 
-            FROM users WHERE email = 'demo@airesumerefine.com'`, async (err, user) => {
-      if (err || !user) {
-        return res.status(500).json({ error: 'Demo user not found' });
-      }
-      
-      const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET);
-      
-      res.json({ 
-        success: true, 
-        token, 
-        user: { 
-          id: user.id,
-          email: user.email,
-          name: user.name || '',
-          plan: user.plan,
-          maxOptimizations: user.max_optimizations,
-          optimizationsUsed: user.optimizations_used,
-          remainingOptimizations: user.remaining_optimizations
-        } 
-      });
+    const user = db.prepare(`SELECT id, email, name, plan, max_optimizations, optimizations_used,
+                                    (max_optimizations - optimizations_used) as remaining_optimizations 
+                             FROM users WHERE email = 'demo@airesumerefine.com'`).get();
+    
+    if (!user) {
+      return res.status(500).json({ error: 'Demo user not found' });
+    }
+    
+    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET);
+    
+    res.json({ 
+      success: true, 
+      token, 
+      user: { 
+        id: user.id,
+        email: user.email,
+        name: user.name || '',
+        plan: user.plan,
+        maxOptimizations: user.max_optimizations,
+        optimizationsUsed: user.optimizations_used,
+        remainingOptimizations: user.remaining_optimizations
+      } 
     });
   } catch (error) {
     console.error('Demo login error:', error);
@@ -382,23 +372,16 @@ app.put('/api/user/profile', authenticateToken, async (req, res) => {
   
   try {
     // Check if email already exists for another user
-    const existingUser = await new Promise((resolve) => {
-      db.get(`SELECT id FROM users WHERE email = ? AND id != ?`, [email, userId], (err, row) => resolve(row));
-    });
+    const existingUser = db.prepare(`SELECT id FROM users WHERE email = ? AND id != ?`).get(email, userId);
     
     if (existingUser) {
       return res.status(400).json({ error: 'Email already in use by another account' });
     }
     
-    db.run(`UPDATE users SET name = ?, email = ? WHERE id = ?`, [name, email, userId], function(err) {
-      if (err) {
-        console.error('Profile update error:', err);
-        return res.status(500).json({ error: 'Failed to update profile' });
-      }
-      
-      console.log(`✅ Profile updated for user ${userId}`);
-      res.json({ success: true, name, email });
-    });
+    db.prepare(`UPDATE users SET name = ?, email = ? WHERE id = ?`).run(name, email, userId);
+    
+    console.log(`✅ Profile updated for user ${userId}`);
+    res.json({ success: true, name, email });
   } catch (error) {
     console.error('Profile update error:', error);
     res.status(500).json({ error: 'Server error' });
@@ -411,9 +394,7 @@ app.put('/api/user/password', authenticateToken, async (req, res) => {
   const { currentPassword, newPassword } = req.body;
   
   try {
-    const user = await new Promise((resolve) => {
-      db.get(`SELECT password_hash FROM users WHERE id = ?`, [userId], (err, row) => resolve(row));
-    });
+    const user = db.prepare(`SELECT password_hash FROM users WHERE id = ?`).get(userId);
     
     // For demo user, skip password check
     if (user.password_hash !== 'demo_hash') {
@@ -424,7 +405,7 @@ app.put('/api/user/password', authenticateToken, async (req, res) => {
     }
     
     const hashedPassword = await bcrypt.hash(newPassword, 10);
-    db.run(`UPDATE users SET password_hash = ? WHERE id = ?`, [hashedPassword, userId]);
+    db.prepare(`UPDATE users SET password_hash = ? WHERE id = ?`).run(hashedPassword, userId);
     
     res.json({ success: true });
   } catch (error) {
@@ -449,9 +430,7 @@ app.post('/api/optimize-resume', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Job description is required' });
     }
     
-    const user = await new Promise((resolve) => {
-      db.get(`SELECT * FROM users WHERE id = ?`, [userId], (err, row) => resolve(row));
-    });
+    const user = db.prepare(`SELECT * FROM users WHERE id = ?`).get(userId);
     
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
@@ -527,20 +506,16 @@ app.post('/api/optimize-resume', authenticateToken, async (req, res) => {
     }
     
     // Increment optimizations used
-    db.run(`UPDATE users SET optimizations_used = optimizations_used + 1 WHERE id = ?`, [userId]);
+    db.prepare(`UPDATE users SET optimizations_used = optimizations_used + 1 WHERE id = ?`).run(userId);
     
     // Save to history
-    db.run(
-      `INSERT INTO optimization_history (user_id, original_resume, job_description, optimized_resume, match_score) VALUES (?, ?, ?, ?, ?)`,
-      [userId, resumeText.substring(0, 1000), jobDescription, result.optimizedResume, result.matchScore]
-    );
+    db.prepare(`INSERT INTO optimization_history (user_id, original_resume, job_description, optimized_resume, match_score) VALUES (?, ?, ?, ?, ?)`).run(
+      userId, resumeText.substring(0, 1000), jobDescription, result.optimizedResume, result.matchScore);
     
     // Get updated user data
-    const updatedUser = await new Promise((resolve) => {
-      db.get(`SELECT id, email, plan, max_optimizations, optimizations_used,
-                     (max_optimizations - optimizations_used) as remaining_optimizations 
-              FROM users WHERE id = ?`, [userId], (err, row) => resolve(row));
-    });
+    const updatedUser = db.prepare(`SELECT id, email, plan, max_optimizations, optimizations_used,
+                                           (max_optimizations - optimizations_used) as remaining_optimizations 
+                                    FROM users WHERE id = ?`).get(userId);
     
     res.json({ 
       ...result, 
@@ -557,34 +532,25 @@ app.post('/api/optimize-resume', authenticateToken, async (req, res) => {
 
 // ============= GET DASHBOARD INFO =============
 app.get('/api/dashboard', authenticateToken, (req, res) => {
-  db.get(
-    `SELECT id, email, name, plan, max_optimizations, optimizations_used,
-            (max_optimizations - optimizations_used) as remaining_optimizations 
-     FROM users WHERE id = ?`,
-    [req.user.userId],
-    (err, user) => {
-      if (err || !user) {
-        return res.status(404).json({ error: 'User not found' });
-      }
-      console.log(`📊 Dashboard data for user ${user.id}:`, { name: user.name, email: user.email });
-      res.json(user);
-    }
-  );
+  const user = db.prepare(`SELECT id, email, name, plan, max_optimizations, optimizations_used,
+                                  (max_optimizations - optimizations_used) as remaining_optimizations 
+                           FROM users WHERE id = ?`).get(req.user.userId);
+  
+  if (!user) {
+    return res.status(404).json({ error: 'User not found' });
+  }
+  console.log(`📊 Dashboard data for user ${user.id}:`, { name: user.name, email: user.email });
+  res.json(user);
 });
 
 // ============= GET OPTIMIZATION HISTORY =============
 app.get('/api/history', authenticateToken, (req, res) => {
-  db.all(
-    `SELECT id, job_description, optimized_resume, match_score, created_at 
-     FROM optimization_history 
-     WHERE user_id = ? 
-     ORDER BY created_at DESC 
-     LIMIT 50`,
-    [req.user.userId],
-    (err, rows) => {
-      res.json(rows || []);
-    }
-  );
+  const rows = db.prepare(`SELECT id, job_description, optimized_resume, match_score, created_at 
+                           FROM optimization_history 
+                           WHERE user_id = ? 
+                           ORDER BY created_at DESC 
+                           LIMIT 50`).all(req.user.userId);
+  res.json(rows || []);
 });
 
 // ============= DELETE SINGLE HISTORY ITEM =============
@@ -592,36 +558,25 @@ app.delete('/api/history/:id', authenticateToken, (req, res) => {
   const { id } = req.params;
   const userId = req.user.userId;
   
-  db.get(`SELECT user_id FROM optimization_history WHERE id = ?`, [id], (err, row) => {
-    if (err || !row) {
-      return res.status(404).json({ error: 'History item not found' });
-    }
-    
-    if (row.user_id !== userId) {
-      return res.status(403).json({ error: 'Unauthorized' });
-    }
-    
-    db.run(`DELETE FROM optimization_history WHERE id = ?`, [id], (err) => {
-      if (err) {
-        console.error('Delete error:', err);
-        return res.status(500).json({ error: 'Failed to delete' });
-      }
-      res.json({ success: true });
-    });
-  });
+  const historyItem = db.prepare(`SELECT user_id FROM optimization_history WHERE id = ?`).get(id);
+  
+  if (!historyItem) {
+    return res.status(404).json({ error: 'History item not found' });
+  }
+  
+  if (historyItem.user_id !== userId) {
+    return res.status(403).json({ error: 'Unauthorized' });
+  }
+  
+  db.prepare(`DELETE FROM optimization_history WHERE id = ?`).run(id);
+  res.json({ success: true });
 });
 
 // ============= DELETE ALL HISTORY FOR USER =============
 app.delete('/api/history', authenticateToken, (req, res) => {
   const userId = req.user.userId;
-  
-  db.run(`DELETE FROM optimization_history WHERE user_id = ?`, [userId], (err) => {
-    if (err) {
-      console.error('Delete all error:', err);
-      return res.status(500).json({ error: 'Failed to delete history' });
-    }
-    res.json({ success: true });
-  });
+  db.prepare(`DELETE FROM optimization_history WHERE user_id = ?`).run(userId);
+  res.json({ success: true });
 });
 
 const PORT = process.env.PORT || 5000;
