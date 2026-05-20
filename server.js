@@ -1,20 +1,33 @@
+require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
 const crypto = require('crypto');
+const sqlite3 = require('sqlite3').verbose();
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const path = require('path');
+const fileUpload = require('express-fileupload');
+
+// PDF Parse
+const pdf = require('pdf-parse');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.use(fileUpload({
+  limits: { fileSize: 10 * 1024 * 1024 },
+}));
 
-// SANDBOX CONFIGURATION - For testing on live domain
+console.log('Claude API Key loaded?', process.env.CLAUDE_API_KEY ? 'YES' : 'NO');
+
+// SANDBOX CONFIGURATION
 const PILOTPAY_CONFIG = {
   apiKey: 'ppk_Zf3GX-MhrqR-nOJitVB2b2ZWvBTYjYe9z0lGsuk7CC0',
   baseUrl: 'https://sandbox.pilotpay.io/api/v1/core',
   isSandbox: true
 };
 
-// YOUR LIVE DOMAIN
 const YOUR_DOMAIN = process.env.DOMAIN_URL || 'https://airesumerefine.com';
 
 app.post('/api/create-payment', async (req, res) => {
@@ -24,7 +37,7 @@ app.post('/api/create-payment', async (req, res) => {
     extOrderId,
     email,
     amount,
-    currency: originalCurrency,  // This is the selected currency from packages page
+    currency: originalCurrency,
     cardNumber,
     expiryMonth,
     expiryYear,
@@ -34,43 +47,36 @@ app.post('/api/create-payment', async (req, res) => {
     billingAddress
   } = req.body;
 
-  // ONLY convert to USD if the currency is NOT already USD
   let finalAmount = amount;
   let finalCurrency = originalCurrency;
   let conversionApplied = false;
 
   if (originalCurrency === 'USD') {
-    // No conversion needed - keep as is
     finalAmount = amount;
     finalCurrency = 'USD';
     conversionApplied = false;
     console.log('💰 Currency is already USD - no conversion applied');
   } else if (originalCurrency === 'EUR') {
-    // Convert EUR to USD
     finalAmount = (parseFloat(amount) * 1.17).toFixed(2);
     finalCurrency = 'USD';
     conversionApplied = true;
     console.log(`🔄 Converted EUR ${amount} to USD ${finalAmount} (rate: 1.17)`);
   } else if (originalCurrency === 'GBP') {
-    // Convert GBP to USD (1 GBP = 1.27 USD)
     finalAmount = (parseFloat(amount) * 1.27).toFixed(2);
     finalCurrency = 'USD';
     conversionApplied = true;
     console.log(`🔄 Converted GBP ${amount} to USD ${finalAmount} (rate: 1.27)`);
   } else if (originalCurrency === 'CAD') {
-    // Convert CAD to USD (1 CAD = 0.73 USD)
     finalAmount = (parseFloat(amount) * 0.73).toFixed(2);
     finalCurrency = 'USD';
     conversionApplied = true;
     console.log(`🔄 Converted CAD ${amount} to USD ${finalAmount} (rate: 0.73)`);
   } else if (originalCurrency === 'AUD') {
-    // Convert AUD to USD (1 AUD = 0.66 USD)
     finalAmount = (parseFloat(amount) * 0.66).toFixed(2);
     finalCurrency = 'USD';
     conversionApplied = true;
     console.log(`🔄 Converted AUD ${amount} to USD ${finalAmount} (rate: 0.66)`);
   } else {
-    // Unknown currency - default to USD with conversion
     finalAmount = (parseFloat(amount) * 1.17).toFixed(2);
     finalCurrency = 'USD';
     conversionApplied = true;
@@ -84,7 +90,7 @@ app.post('/api/create-payment', async (req, res) => {
     description: "CV Optimization",
     tag: `order-${extOrderId}`,
     amount: finalAmount,
-    currency: finalCurrency,  // Always send USD to PilotPay
+    currency: finalCurrency,
     type: "fiat",
     method: "card",
     additions: {
@@ -119,15 +125,7 @@ app.post('/api/create-payment', async (req, res) => {
     );
 
     console.log('✅ PilotPay Success:', response.status);
-    console.log('Payment Info:', {
-      original_currency: originalCurrency,
-      original_amount: amount,
-      sent_currency: finalCurrency,
-      sent_amount: finalAmount,
-      conversion_applied: conversionApplied
-    });
     
-    // Extract redirect URL
     let redirectUrl = null;
     if (response.data.context?.paymentDetails?.url) {
       redirectUrl = response.data.context.paymentDetails.url;
@@ -194,13 +192,450 @@ app.get('/api/payment-status/:paymentId', async (req, res) => {
   }
 });
 
+// Initialize database
+const db = new sqlite3.Database(path.join(__dirname, 'resume_refiner.db'));
+
+// Create tables with new schema (no credits, just usage limits)
+db.serialize(() => {
+  db.run(`CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT UNIQUE,
+    name TEXT DEFAULT '',
+    password_hash TEXT,
+    plan TEXT,
+    max_optimizations INTEGER DEFAULT 10,
+    optimizations_used INTEGER DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
+  
+  db.run(`CREATE TABLE IF NOT EXISTS optimization_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    original_resume TEXT,
+    job_description TEXT,
+    optimized_resume TEXT,
+    match_score INTEGER,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
+  
+  // Migrate existing users if needed
+  db.run(`ALTER TABLE users ADD COLUMN name TEXT DEFAULT ''`, (err) => {
+    if (err && !err.message.includes('duplicate')) {
+      console.log('Note: name column may already exist');
+    }
+  });
+  
+  db.run(`ALTER TABLE users ADD COLUMN max_optimizations INTEGER DEFAULT 10`, (err) => {
+    if (err && !err.message.includes('duplicate')) {
+      console.log('Note: max_optimizations column may already exist');
+    }
+  });
+  
+  db.run(`ALTER TABLE users ADD COLUMN optimizations_used INTEGER DEFAULT 0`, (err) => {
+    if (err && !err.message.includes('duplicate')) {
+      console.log('Note: optimizations_used column may already exist');
+    }
+  });
+  
+  // Update existing users based on plan
+  db.run(`UPDATE users SET max_optimizations = 10 WHERE plan = 'basic' AND (max_optimizations IS NULL OR max_optimizations = 0)`);
+  db.run(`UPDATE users SET max_optimizations = 20 WHERE plan = 'advance' AND (max_optimizations IS NULL OR max_optimizations = 0)`);
+  db.run(`UPDATE users SET max_optimizations = 30 WHERE plan = 'top' AND (max_optimizations IS NULL OR max_optimizations = 0)`);
+  db.run(`UPDATE users SET optimizations_used = 0 WHERE optimizations_used IS NULL`);
+  
+  // Create demo user with TOP plan (30 optimizations)
+  db.get(`SELECT * FROM users WHERE email = 'demo@airesumerefine.com'`, (err, user) => {
+    if (!user) {
+      db.run(`INSERT INTO users (email, name, password_hash, plan, max_optimizations, optimizations_used) VALUES (?, ?, ?, ?, ?, ?)`, 
+        ['demo@airesumerefine.com', 'Demo User', 'demo_hash', 'top', 30, 0]);
+      console.log('✅ Demo user created with TOP plan (30 optimizations)');
+    } else {
+      db.run(`UPDATE users SET max_optimizations = 30, plan = 'top' WHERE email = 'demo@airesumerefine.com'`);
+      console.log('✅ Demo user updated with TOP plan (30 optimizations)');
+    }
+  });
+});
+
+const JWT_SECRET = process.env.JWT_SECRET || 'your_super_secret_key_change_this_to_something_random';
+
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  
+  if (!token) return res.status(401).json({ error: 'Access denied' });
+  
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) return res.status(403).json({ error: 'Invalid token' });
+    req.user = user;
+    next();
+  });
+}
+
+async function extractTextFromFile(file) {
+  const fileName = file.name;
+  const fileExtension = fileName.split('.').pop().toLowerCase();
+  
+  try {
+    if (fileExtension === 'pdf') {
+      const data = await pdf(file.data);
+      return data.text;
+    } 
+    else if (fileExtension === 'txt') {
+      return file.data.toString('utf8');
+    }
+    else if (fileExtension === 'docx') {
+      return "DOCX support coming soon. Please use PDF or TXT for now.";
+    }
+    else {
+      return "Unsupported file format. Please upload PDF or TXT.";
+    }
+  } catch (error) {
+    console.error('File extraction error:', error);
+    return "Could not extract text from file.";
+  }
+}
+
+// ============= TEST CLAUDE API ENDPOINT =============
+app.get('/api/test-claude', async (req, res) => {
+  try {
+    console.log('🔍 Testing Claude API connection...');
+    
+    const response = await axios.post('https://api.anthropic.com/v1/messages', {
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 50,
+      messages: [
+        { role: 'user', content: 'Say "API works!"' }
+      ]
+    }, {
+      headers: {
+        'x-api-key': process.env.CLAUDE_API_KEY,
+        'anthropic-version': '2023-06-01',
+        'Content-Type': 'application/json'
+      },
+      timeout: 10000
+    });
+    
+    console.log('✅ Claude API test successful!');
+    res.json({ success: true, message: response.data.content[0].text });
+    
+  } catch (error) {
+    console.error('❌ Claude API test failed:');
+    console.error('Status:', error.response?.status);
+    console.error('Message:', error.response?.data?.error?.message || error.message);
+    
+    res.status(500).json({ 
+      success: false, 
+      error: error.response?.data?.error?.message || error.message,
+      status: error.response?.status 
+    });
+  }
+});
+
+// ============= GET PLAN LIMITS =============
+app.get('/api/plan-limits', (req, res) => {
+  const planLimits = {
+    basic: { maxOptimizations: 10, price: 240 },
+    advance: { maxOptimizations: 20, price: 480 },
+    top: { maxOptimizations: 30, price: 700 }
+  };
+  res.json(planLimits);
+});
+
+// ============= DEMO LOGIN =============
+app.post('/api/demo-login', async (req, res) => {
+  try {
+    db.get(`SELECT id, email, name, plan, max_optimizations, optimizations_used,
+                   (max_optimizations - optimizations_used) as remaining_optimizations 
+            FROM users WHERE email = 'demo@airesumerefine.com'`, async (err, user) => {
+      if (err || !user) {
+        return res.status(500).json({ error: 'Demo user not found' });
+      }
+      
+      const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET);
+      
+      res.json({ 
+        success: true, 
+        token, 
+        user: { 
+          id: user.id,
+          email: user.email,
+          name: user.name || '',
+          plan: user.plan,
+          maxOptimizations: user.max_optimizations,
+          optimizationsUsed: user.optimizations_used,
+          remainingOptimizations: user.remaining_optimizations
+        } 
+      });
+    });
+  } catch (error) {
+    console.error('Demo login error:', error);
+    res.status(500).json({ error: 'Demo login failed' });
+  }
+});
+
+// ============= UPDATE USER PROFILE =============
+app.put('/api/user/profile', authenticateToken, async (req, res) => {
+  const userId = req.user.userId;
+  const { name, email } = req.body;
+  
+  console.log(`📝 Updating profile for user ${userId}:`, { name, email });
+  
+  try {
+    // Check if email already exists for another user
+    const existingUser = await new Promise((resolve) => {
+      db.get(`SELECT id FROM users WHERE email = ? AND id != ?`, [email, userId], (err, row) => resolve(row));
+    });
+    
+    if (existingUser) {
+      return res.status(400).json({ error: 'Email already in use by another account' });
+    }
+    
+    db.run(`UPDATE users SET name = ?, email = ? WHERE id = ?`, [name, email, userId], function(err) {
+      if (err) {
+        console.error('Profile update error:', err);
+        return res.status(500).json({ error: 'Failed to update profile' });
+      }
+      
+      console.log(`✅ Profile updated for user ${userId}`);
+      res.json({ success: true, name, email });
+    });
+  } catch (error) {
+    console.error('Profile update error:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ============= UPDATE PASSWORD =============
+app.put('/api/user/password', authenticateToken, async (req, res) => {
+  const userId = req.user.userId;
+  const { currentPassword, newPassword } = req.body;
+  
+  try {
+    const user = await new Promise((resolve) => {
+      db.get(`SELECT password_hash FROM users WHERE id = ?`, [userId], (err, row) => resolve(row));
+    });
+    
+    // For demo user, skip password check
+    if (user.password_hash !== 'demo_hash') {
+      const valid = await bcrypt.compare(currentPassword, user.password_hash);
+      if (!valid) {
+        return res.status(401).json({ error: 'Current password is incorrect' });
+      }
+    }
+    
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    db.run(`UPDATE users SET password_hash = ? WHERE id = ?`, [hashedPassword, userId]);
+    
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Password update error:', error);
+    res.status(500).json({ error: 'Failed to update password' });
+  }
+});
+
+// ============= CV OPTIMIZATION WITH CLAUDE API =============
+app.post('/api/optimize-resume', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { jobDescription } = req.body;
+    
+    if (!req.files || !req.files.resume) {
+      return res.status(400).json({ error: 'Resume file is required' });
+    }
+    
+    const resumeFile = req.files.resume;
+    
+    if (!jobDescription) {
+      return res.status(400).json({ error: 'Job description is required' });
+    }
+    
+    const user = await new Promise((resolve) => {
+      db.get(`SELECT * FROM users WHERE id = ?`, [userId], (err, row) => resolve(row));
+    });
+    
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    // Check if user has reached their limit
+    const remainingOptimizations = user.max_optimizations - user.optimizations_used;
+    if (remainingOptimizations <= 0) {
+      return res.status(402).json({ 
+        error: `You've used all ${user.max_optimizations} optimizations in your ${user.plan} plan. Please upgrade to continue.` 
+      });
+    }
+    
+    const resumeText = await extractTextFromFile(resumeFile);
+    
+    if (!resumeText || resumeText.length < 50) {
+      return res.status(400).json({ error: 'Could not extract enough text from your file. Please ensure it\'s a text-based PDF or TXT file.' });
+    }
+    
+    // Claude model mapping based on plan
+    const claudeModels = {
+      basic: 'claude-haiku-4-5-20251001',
+      advance: 'claude-sonnet-4-5-20250929',
+      top: 'claude-opus-4-5-20251101'
+    };
+
+    const model = claudeModels[user.plan?.toLowerCase()] || 'claude-sonnet-4-5-20250929';
+    
+    // Prompts for different plans
+    const prompts = {
+      basic: `You are a resume optimizer. Optimize this resume for the job description. Return ONLY valid JSON in this format: {"optimizedResume": "the optimized resume text here", "matchScore": 85}`,
+      
+      advance: `You are an expert resume optimizer. Thoroughly optimize this resume for the job description. Add relevant keywords and quantify achievements where possible. Return ONLY valid JSON in this format: {"optimizedResume": "optimized text", "matchScore": 85, "missingKeywords": ["keyword1", "keyword2", "keyword3"], "suggestions": ["suggestion1", "suggestion2", "suggestion3"]}`,
+      
+      top: `You are a career coach and resume expert. Provide premium-level optimization. Analyze deeply and return ONLY valid JSON in this format: {"optimizedResume": "detailed optimized resume", "matchScore": 85, "missingKeywords": ["kw1","kw2","kw3","kw4","kw5"], "suggestions": ["suggestion1","suggestion2","suggestion3","suggestion4","suggestion5"], "atsScore": 85, "linkedinSummary": "optimized LinkedIn summary text"}`
+    };
+    
+    const systemPrompt = prompts[user.plan?.toLowerCase()] || prompts.basic;
+    
+    console.log(`🎯 Calling Claude API with model: ${model} for user ${userId}`);
+    console.log(`📄 Resume text length: ${resumeText.length} characters`);
+    console.log(`📊 Usage: ${user.optimizations_used}/${user.max_optimizations} optimizations used`);
+    
+    const response = await axios.post('https://api.anthropic.com/v1/messages', {
+      model: model,
+      max_tokens: 8192,
+      system: systemPrompt,
+      messages: [
+        { 
+          role: 'user', 
+          content: `RESUME:\n${resumeText}\n\nJOB DESCRIPTION:\n${jobDescription}\n\nIMPORTANT: Return ONLY valid JSON, no other text. Do not wrap in markdown code blocks.` 
+        }
+      ]
+    }, {
+      headers: {
+        'x-api-key': process.env.CLAUDE_API_KEY,
+        'anthropic-version': '2023-06-01',
+        'Content-Type': 'application/json'
+      },
+      timeout: 90000
+    });
+    
+    // Parse Claude response
+    let result;
+    try {
+      let aiResponse = response.data.content[0].text;
+      aiResponse = aiResponse.replace(/```json\n?/g, '').replace(/```\n?/g, '');
+      result = JSON.parse(aiResponse);
+    } catch (parseError) {
+      console.error('JSON parse error:', parseError);
+      console.error('Raw response (first 500 chars):', response.data.content[0].text.substring(0, 500));
+      return res.status(500).json({ error: 'AI returned invalid response format. Please try again with a shorter resume or job description.' });
+    }
+    
+    // Increment optimizations used
+    db.run(`UPDATE users SET optimizations_used = optimizations_used + 1 WHERE id = ?`, [userId]);
+    
+    // Save to history
+    db.run(
+      `INSERT INTO optimization_history (user_id, original_resume, job_description, optimized_resume, match_score) VALUES (?, ?, ?, ?, ?)`,
+      [userId, resumeText.substring(0, 1000), jobDescription, result.optimizedResume, result.matchScore]
+    );
+    
+    // Get updated user data
+    const updatedUser = await new Promise((resolve) => {
+      db.get(`SELECT id, email, plan, max_optimizations, optimizations_used,
+                     (max_optimizations - optimizations_used) as remaining_optimizations 
+              FROM users WHERE id = ?`, [userId], (err, row) => resolve(row));
+    });
+    
+    res.json({ 
+      ...result, 
+      remainingOptimizations: updatedUser.remaining_optimizations,
+      optimizationsUsed: updatedUser.optimizations_used,
+      maxOptimizations: updatedUser.max_optimizations
+    });
+    
+  } catch (error) {
+    console.error('Claude API error:', error.response?.data || error.message);
+    res.status(500).json({ error: 'AI optimization failed. Please try again.' });
+  }
+});
+
+// ============= GET DASHBOARD INFO =============
+app.get('/api/dashboard', authenticateToken, (req, res) => {
+  db.get(
+    `SELECT id, email, name, plan, max_optimizations, optimizations_used,
+            (max_optimizations - optimizations_used) as remaining_optimizations 
+     FROM users WHERE id = ?`,
+    [req.user.userId],
+    (err, user) => {
+      if (err || !user) {
+        return res.status(404).json({ error: 'User not found' });
+      }
+      console.log(`📊 Dashboard data for user ${user.id}:`, { name: user.name, email: user.email });
+      res.json(user);
+    }
+  );
+});
+
+// ============= GET OPTIMIZATION HISTORY =============
+app.get('/api/history', authenticateToken, (req, res) => {
+  db.all(
+    `SELECT id, job_description, optimized_resume, match_score, created_at 
+     FROM optimization_history 
+     WHERE user_id = ? 
+     ORDER BY created_at DESC 
+     LIMIT 50`,
+    [req.user.userId],
+    (err, rows) => {
+      res.json(rows || []);
+    }
+  );
+});
+
+// ============= DELETE SINGLE HISTORY ITEM =============
+app.delete('/api/history/:id', authenticateToken, (req, res) => {
+  const { id } = req.params;
+  const userId = req.user.userId;
+  
+  db.get(`SELECT user_id FROM optimization_history WHERE id = ?`, [id], (err, row) => {
+    if (err || !row) {
+      return res.status(404).json({ error: 'History item not found' });
+    }
+    
+    if (row.user_id !== userId) {
+      return res.status(403).json({ error: 'Unauthorized' });
+    }
+    
+    db.run(`DELETE FROM optimization_history WHERE id = ?`, [id], (err) => {
+      if (err) {
+        console.error('Delete error:', err);
+        return res.status(500).json({ error: 'Failed to delete' });
+      }
+      res.json({ success: true });
+    });
+  });
+});
+
+// ============= DELETE ALL HISTORY FOR USER =============
+app.delete('/api/history', authenticateToken, (req, res) => {
+  const userId = req.user.userId;
+  
+  db.run(`DELETE FROM optimization_history WHERE user_id = ?`, [userId], (err) => {
+    if (err) {
+      console.error('Delete all error:', err);
+      return res.status(500).json({ error: 'Failed to delete history' });
+    }
+    res.json({ success: true });
+  });
+});
+
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`========================================`);
-  console.log(`✅ PilotPay Backend Running`);
+  console.log(`✅ Server Running`);
   console.log(`   Port: ${PORT}`);
-  console.log(`   Environment: ${PILOTPAY_CONFIG.isSandbox ? 'SANDBOX' : 'PRODUCTION'}`);
-  console.log(`   Domain: ${YOUR_DOMAIN}`);
-  console.log(`   Currency Conversion: Enabled (EUR/GBP/CAD/AUD → USD, USD stays USD)`);
+  console.log(`   Claude API: ${process.env.CLAUDE_API_KEY ? '✅ Loaded' : '❌ Missing'}`);
+  console.log(`   Demo user: demo@airesumerefine.com (TOP plan - 30 optimizations)`);
+  console.log(`   Test endpoint: http://localhost:${PORT}/api/test-claude`);
+  console.log(`========================================`);
+  console.log(`📊 Plan Limits:`);
+  console.log(`   Basic: 10 optimizations`);
+  console.log(`   Advance: 20 optimizations`);
+  console.log(`   Top: 30 optimizations`);
   console.log(`========================================`);
 });
