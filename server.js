@@ -3,7 +3,7 @@ const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
 const crypto = require('crypto');
-const Database = require('better-sqlite3');  // ← Changed
+const sqlite3 = require('sqlite3').verbose();
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const path = require('path');
@@ -30,8 +30,8 @@ const PILOTPAY_CONFIG = {
 
 const YOUR_DOMAIN = process.env.DOMAIN_URL || 'https://airesumerefine.com';
 
+// ============= PAYMENT ENDPOINTS =============
 app.post('/api/create-payment', async (req, res) => {
-  // ... keep your existing payment code exactly the same ...
   console.log('Received Direct API request:', req.body);
   
   const {
@@ -193,60 +193,59 @@ app.get('/api/payment-status/:paymentId', async (req, res) => {
   }
 });
 
-// ============= DATABASE SETUP WITH BETTER-SQLITE3 =============
-const db = new Database(path.join(__dirname, 'resume_refiner.db'));
+// ============= DATABASE SETUP =============
+const db = new sqlite3.Database(path.join(__dirname, 'resume_refiner.db'));
 
-// Create tables (synchronous - no callbacks!)
-db.exec(`CREATE TABLE IF NOT EXISTS users (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  email TEXT UNIQUE,
-  name TEXT DEFAULT '',
-  password_hash TEXT,
-  plan TEXT,
-  max_optimizations INTEGER DEFAULT 10,
-  optimizations_used INTEGER DEFAULT 0,
-  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-)`);
+// Create tables
+db.serialize(() => {
+  db.run(`CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT UNIQUE,
+    name TEXT DEFAULT '',
+    password_hash TEXT,
+    plan TEXT,
+    max_optimizations INTEGER DEFAULT 10,
+    optimizations_used INTEGER DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
+  
+  db.run(`CREATE TABLE IF NOT EXISTS optimization_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    original_resume TEXT,
+    job_description TEXT,
+    optimized_resume TEXT,
+    match_score INTEGER,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
+  
+  // Add columns if needed
+  db.run(`ALTER TABLE users ADD COLUMN name TEXT DEFAULT ''`, () => {});
+  db.run(`ALTER TABLE users ADD COLUMN max_optimizations INTEGER DEFAULT 10`, () => {});
+  db.run(`ALTER TABLE users ADD COLUMN optimizations_used INTEGER DEFAULT 0`, () => {});
+  
+  // Update existing users
+  db.run(`UPDATE users SET max_optimizations = 10 WHERE plan = 'basic' AND (max_optimizations IS NULL OR max_optimizations = 0)`);
+  db.run(`UPDATE users SET max_optimizations = 20 WHERE plan = 'advance' AND (max_optimizations IS NULL OR max_optimizations = 0)`);
+  db.run(`UPDATE users SET max_optimizations = 30 WHERE plan = 'top' AND (max_optimizations IS NULL OR max_optimizations = 0)`);
+  db.run(`UPDATE users SET optimizations_used = 0 WHERE optimizations_used IS NULL`);
+  
+  // Create demo user
+  db.get(`SELECT * FROM users WHERE email = 'demo@airesumerefine.com'`, (err, user) => {
+    if (!user) {
+      db.run(`INSERT INTO users (email, name, password_hash, plan, max_optimizations, optimizations_used) VALUES (?, ?, ?, ?, ?, ?)`, 
+        ['demo@airesumerefine.com', 'Demo User', 'demo_hash', 'top', 30, 0]);
+      console.log('✅ Demo user created');
+    }
+  });
+});
 
-db.exec(`CREATE TABLE IF NOT EXISTS optimization_history (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER,
-  original_resume TEXT,
-  job_description TEXT,
-  optimized_resume TEXT,
-  match_score INTEGER,
-  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-)`);
+// Add a root route for testing
+app.get('/', (req, res) => {
+  res.send('✅ Resume Refiner Backend is running');
+});
 
-// Add columns if they don't exist (try/catch for safety)
-try {
-  db.exec(`ALTER TABLE users ADD COLUMN name TEXT DEFAULT ''`);
-} catch(e) { /* column might already exist */ }
-try {
-  db.exec(`ALTER TABLE users ADD COLUMN max_optimizations INTEGER DEFAULT 10`);
-} catch(e) { /* column might already exist */ }
-try {
-  db.exec(`ALTER TABLE users ADD COLUMN optimizations_used INTEGER DEFAULT 0`);
-} catch(e) { /* column might already exist */ }
-
-// Update existing users based on plan
-db.exec(`UPDATE users SET max_optimizations = 10 WHERE plan = 'basic' AND (max_optimizations IS NULL OR max_optimizations = 0)`);
-db.exec(`UPDATE users SET max_optimizations = 20 WHERE plan = 'advance' AND (max_optimizations IS NULL OR max_optimizations = 0)`);
-db.exec(`UPDATE users SET max_optimizations = 30 WHERE plan = 'top' AND (max_optimizations IS NULL OR max_optimizations = 0)`);
-db.exec(`UPDATE users SET optimizations_used = 0 WHERE optimizations_used IS NULL`);
-
-// Create or update demo user
-const demoUser = db.prepare(`SELECT * FROM users WHERE email = 'demo@airesumerefine.com'`).get();
-if (!demoUser) {
-  db.prepare(`INSERT INTO users (email, name, password_hash, plan, max_optimizations, optimizations_used) VALUES (?, ?, ?, ?, ?, ?)`).run(
-    'demo@airesumerefine.com', 'Demo User', 'demo_hash', 'top', 30, 0);
-  console.log('✅ Demo user created with TOP plan (30 optimizations)');
-} else {
-  db.prepare(`UPDATE users SET max_optimizations = 30, plan = 'top' WHERE email = 'demo@airesumerefine.com'`).run();
-  console.log('✅ Demo user updated with TOP plan (30 optimizations)');
-}
-
-const JWT_SECRET = process.env.JWT_SECRET || 'your_super_secret_key_change_this_to_something_random';
+const JWT_SECRET = process.env.JWT_SECRET || 'your_super_secret_key_change_this';
 
 function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
@@ -272,9 +271,6 @@ async function extractTextFromFile(file) {
     } 
     else if (fileExtension === 'txt') {
       return file.data.toString('utf8');
-    }
-    else if (fileExtension === 'docx') {
-      return "DOCX support coming soon. Please use PDF or TXT for now.";
     }
     else {
       return "Unsupported file format. Please upload PDF or TXT.";
@@ -310,52 +306,35 @@ app.get('/api/test-claude', async (req, res) => {
     
   } catch (error) {
     console.error('❌ Claude API test failed:');
-    console.error('Status:', error.response?.status);
-    console.error('Message:', error.response?.data?.error?.message || error.message);
-    
-    res.status(500).json({ 
-      success: false, 
-      error: error.response?.data?.error?.message || error.message,
-      status: error.response?.status 
-    });
+    res.status(500).json({ success: false, error: error.message });
   }
-});
-
-// ============= GET PLAN LIMITS =============
-app.get('/api/plan-limits', (req, res) => {
-  const planLimits = {
-    basic: { maxOptimizations: 10, price: 240 },
-    advance: { maxOptimizations: 20, price: 480 },
-    top: { maxOptimizations: 30, price: 700 }
-  };
-  res.json(planLimits);
 });
 
 // ============= DEMO LOGIN =============
 app.post('/api/demo-login', async (req, res) => {
   try {
-    const user = db.prepare(`SELECT id, email, name, plan, max_optimizations, optimizations_used,
-                                    (max_optimizations - optimizations_used) as remaining_optimizations 
-                             FROM users WHERE email = 'demo@airesumerefine.com'`).get();
-    
-    if (!user) {
-      return res.status(500).json({ error: 'Demo user not found' });
-    }
-    
-    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET);
-    
-    res.json({ 
-      success: true, 
-      token, 
-      user: { 
-        id: user.id,
-        email: user.email,
-        name: user.name || '',
-        plan: user.plan,
-        maxOptimizations: user.max_optimizations,
-        optimizationsUsed: user.optimizations_used,
-        remainingOptimizations: user.remaining_optimizations
-      } 
+    db.get(`SELECT id, email, name, plan, max_optimizations, optimizations_used,
+                   (max_optimizations - optimizations_used) as remaining_optimizations 
+            FROM users WHERE email = 'demo@airesumerefine.com'`, (err, user) => {
+      if (err || !user) {
+        return res.status(500).json({ error: 'Demo user not found' });
+      }
+      
+      const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET);
+      
+      res.json({ 
+        success: true, 
+        token, 
+        user: { 
+          id: user.id,
+          email: user.email,
+          name: user.name || '',
+          plan: user.plan,
+          maxOptimizations: user.max_optimizations,
+          optimizationsUsed: user.optimizations_used,
+          remainingOptimizations: user.remaining_optimizations
+        } 
+      });
     });
   } catch (error) {
     console.error('Demo login error:', error);
@@ -364,28 +343,16 @@ app.post('/api/demo-login', async (req, res) => {
 });
 
 // ============= UPDATE USER PROFILE =============
-app.put('/api/user/profile', authenticateToken, async (req, res) => {
+app.put('/api/user/profile', authenticateToken, (req, res) => {
   const userId = req.user.userId;
   const { name, email } = req.body;
   
-  console.log(`📝 Updating profile for user ${userId}:`, { name, email });
-  
-  try {
-    // Check if email already exists for another user
-    const existingUser = db.prepare(`SELECT id FROM users WHERE email = ? AND id != ?`).get(email, userId);
-    
-    if (existingUser) {
-      return res.status(400).json({ error: 'Email already in use by another account' });
+  db.run(`UPDATE users SET name = ?, email = ? WHERE id = ?`, [name, email, userId], function(err) {
+    if (err) {
+      return res.status(500).json({ error: 'Failed to update profile' });
     }
-    
-    db.prepare(`UPDATE users SET name = ?, email = ? WHERE id = ?`).run(name, email, userId);
-    
-    console.log(`✅ Profile updated for user ${userId}`);
     res.json({ success: true, name, email });
-  } catch (error) {
-    console.error('Profile update error:', error);
-    res.status(500).json({ error: 'Server error' });
-  }
+  });
 });
 
 // ============= UPDATE PASSWORD =============
@@ -393,10 +360,11 @@ app.put('/api/user/password', authenticateToken, async (req, res) => {
   const userId = req.user.userId;
   const { currentPassword, newPassword } = req.body;
   
-  try {
-    const user = db.prepare(`SELECT password_hash FROM users WHERE id = ?`).get(userId);
+  db.get(`SELECT password_hash FROM users WHERE id = ?`, [userId], async (err, user) => {
+    if (err || !user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
     
-    // For demo user, skip password check
     if (user.password_hash !== 'demo_hash') {
       const valid = await bcrypt.compare(currentPassword, user.password_hash);
       if (!valid) {
@@ -405,16 +373,12 @@ app.put('/api/user/password', authenticateToken, async (req, res) => {
     }
     
     const hashedPassword = await bcrypt.hash(newPassword, 10);
-    db.prepare(`UPDATE users SET password_hash = ? WHERE id = ?`).run(hashedPassword, userId);
-    
+    db.run(`UPDATE users SET password_hash = ? WHERE id = ?`, [hashedPassword, userId]);
     res.json({ success: true });
-  } catch (error) {
-    console.error('Password update error:', error);
-    res.status(500).json({ error: 'Failed to update password' });
-  }
+  });
 });
 
-// ============= CV OPTIMIZATION WITH CLAUDE API =============
+// ============= CV OPTIMIZATION =============
 app.post('/api/optimize-resume', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
@@ -426,171 +390,121 @@ app.post('/api/optimize-resume', authenticateToken, async (req, res) => {
     
     const resumeFile = req.files.resume;
     
-    if (!jobDescription) {
-      return res.status(400).json({ error: 'Job description is required' });
-    }
-    
-    const user = db.prepare(`SELECT * FROM users WHERE id = ?`).get(userId);
-    
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-    
-    // Check if user has reached their limit
-    const remainingOptimizations = user.max_optimizations - user.optimizations_used;
-    if (remainingOptimizations <= 0) {
-      return res.status(402).json({ 
-        error: `You've used all ${user.max_optimizations} optimizations in your ${user.plan} plan. Please upgrade to continue.` 
+    db.get(`SELECT * FROM users WHERE id = ?`, [userId], async (err, user) => {
+      if (err || !user) {
+        return res.status(404).json({ error: 'User not found' });
+      }
+      
+      const remainingOptimizations = user.max_optimizations - user.optimizations_used;
+      if (remainingOptimizations <= 0) {
+        return res.status(402).json({ 
+          error: `You've used all ${user.max_optimizations} optimizations. Please upgrade.` 
+        });
+      }
+      
+      const resumeText = await extractTextFromFile(resumeFile);
+      
+      if (!resumeText || resumeText.length < 50) {
+        return res.status(400).json({ error: 'Could not extract enough text from your file.' });
+      }
+      
+      const claudeModels = {
+        basic: 'claude-haiku-4-5-20251001',
+        advance: 'claude-sonnet-4-5-20250929',
+        top: 'claude-opus-4-5-20251101'
+      };
+      
+      const model = claudeModels[user.plan?.toLowerCase()] || 'claude-sonnet-4-5-20250929';
+      
+      const prompts = {
+        basic: `Return ONLY valid JSON: {"optimizedResume": "...", "matchScore": 85}`,
+        advance: `Return ONLY valid JSON: {"optimizedResume": "...", "matchScore": 85, "missingKeywords": [...], "suggestions": [...]}`,
+        top: `Return ONLY valid JSON: {"optimizedResume": "...", "matchScore": 85, "missingKeywords": [...], "suggestions": [...], "atsScore": 85, "linkedinSummary": "..."}`
+      };
+      
+      const systemPrompt = prompts[user.plan?.toLowerCase()] || prompts.basic;
+      
+      const response = await axios.post('https://api.anthropic.com/v1/messages', {
+        model: model,
+        max_tokens: 8192,
+        system: systemPrompt,
+        messages: [{ role: 'user', content: `RESUME:\n${resumeText}\n\nJOB DESCRIPTION:\n${jobDescription}` }]
+      }, {
+        headers: {
+          'x-api-key': process.env.CLAUDE_API_KEY,
+          'anthropic-version': '2023-06-01',
+          'Content-Type': 'application/json'
+        },
+        timeout: 90000
       });
-    }
-    
-    const resumeText = await extractTextFromFile(resumeFile);
-    
-    if (!resumeText || resumeText.length < 50) {
-      return res.status(400).json({ error: 'Could not extract enough text from your file. Please ensure it\'s a text-based PDF or TXT file.' });
-    }
-    
-    // Claude model mapping based on plan
-    const claudeModels = {
-      basic: 'claude-haiku-4-5-20251001',
-      advance: 'claude-sonnet-4-5-20250929',
-      top: 'claude-opus-4-5-20251101'
-    };
-
-    const model = claudeModels[user.plan?.toLowerCase()] || 'claude-sonnet-4-5-20250929';
-    
-    // Prompts for different plans
-    const prompts = {
-      basic: `You are a resume optimizer. Optimize this resume for the job description. Return ONLY valid JSON in this format: {"optimizedResume": "the optimized resume text here", "matchScore": 85}`,
       
-      advance: `You are an expert resume optimizer. Thoroughly optimize this resume for the job description. Add relevant keywords and quantify achievements where possible. Return ONLY valid JSON in this format: {"optimizedResume": "optimized text", "matchScore": 85, "missingKeywords": ["keyword1", "keyword2", "keyword3"], "suggestions": ["suggestion1", "suggestion2", "suggestion3"]}`,
+      let result;
+      try {
+        let aiResponse = response.data.content[0].text;
+        aiResponse = aiResponse.replace(/```json\n?/g, '').replace(/```\n?/g, '');
+        result = JSON.parse(aiResponse);
+      } catch (parseError) {
+        return res.status(500).json({ error: 'AI returned invalid response format' });
+      }
       
-      top: `You are a career coach and resume expert. Provide premium-level optimization. Analyze deeply and return ONLY valid JSON in this format: {"optimizedResume": "detailed optimized resume", "matchScore": 85, "missingKeywords": ["kw1","kw2","kw3","kw4","kw5"], "suggestions": ["suggestion1","suggestion2","suggestion3","suggestion4","suggestion5"], "atsScore": 85, "linkedinSummary": "optimized LinkedIn summary text"}`
-    };
-    
-    const systemPrompt = prompts[user.plan?.toLowerCase()] || prompts.basic;
-    
-    console.log(`🎯 Calling Claude API with model: ${model} for user ${userId}`);
-    console.log(`📄 Resume text length: ${resumeText.length} characters`);
-    console.log(`📊 Usage: ${user.optimizations_used}/${user.max_optimizations} optimizations used`);
-    
-    const response = await axios.post('https://api.anthropic.com/v1/messages', {
-      model: model,
-      max_tokens: 8192,
-      system: systemPrompt,
-      messages: [
-        { 
-          role: 'user', 
-          content: `RESUME:\n${resumeText}\n\nJOB DESCRIPTION:\n${jobDescription}\n\nIMPORTANT: Return ONLY valid JSON, no other text. Do not wrap in markdown code blocks.` 
-        }
-      ]
-    }, {
-      headers: {
-        'x-api-key': process.env.CLAUDE_API_KEY,
-        'anthropic-version': '2023-06-01',
-        'Content-Type': 'application/json'
-      },
-      timeout: 90000
+      db.run(`UPDATE users SET optimizations_used = optimizations_used + 1 WHERE id = ?`, [userId]);
+      
+      db.run(`INSERT INTO optimization_history (user_id, original_resume, job_description, optimized_resume, match_score) VALUES (?, ?, ?, ?, ?)`,
+        [userId, resumeText.substring(0, 1000), jobDescription, result.optimizedResume, result.matchScore]);
+      
+      db.get(`SELECT max_optimizations, optimizations_used, (max_optimizations - optimizations_used) as remaining_optimizations FROM users WHERE id = ?`, [userId], (err, updatedUser) => {
+        res.json({ ...result, remainingOptimizations: updatedUser.remaining_optimizations });
+      });
     });
-    
-    // Parse Claude response
-    let result;
-    try {
-      let aiResponse = response.data.content[0].text;
-      aiResponse = aiResponse.replace(/```json\n?/g, '').replace(/```\n?/g, '');
-      result = JSON.parse(aiResponse);
-    } catch (parseError) {
-      console.error('JSON parse error:', parseError);
-      console.error('Raw response (first 500 chars):', response.data.content[0].text.substring(0, 500));
-      return res.status(500).json({ error: 'AI returned invalid response format. Please try again with a shorter resume or job description.' });
-    }
-    
-    // Increment optimizations used
-    db.prepare(`UPDATE users SET optimizations_used = optimizations_used + 1 WHERE id = ?`).run(userId);
-    
-    // Save to history
-    db.prepare(`INSERT INTO optimization_history (user_id, original_resume, job_description, optimized_resume, match_score) VALUES (?, ?, ?, ?, ?)`).run(
-      userId, resumeText.substring(0, 1000), jobDescription, result.optimizedResume, result.matchScore);
-    
-    // Get updated user data
-    const updatedUser = db.prepare(`SELECT id, email, plan, max_optimizations, optimizations_used,
-                                           (max_optimizations - optimizations_used) as remaining_optimizations 
-                                    FROM users WHERE id = ?`).get(userId);
-    
-    res.json({ 
-      ...result, 
-      remainingOptimizations: updatedUser.remaining_optimizations,
-      optimizationsUsed: updatedUser.optimizations_used,
-      maxOptimizations: updatedUser.max_optimizations
-    });
-    
   } catch (error) {
-    console.error('Claude API error:', error.response?.data || error.message);
-    res.status(500).json({ error: 'AI optimization failed. Please try again.' });
+    console.error('Optimization error:', error);
+    res.status(500).json({ error: 'AI optimization failed' });
   }
 });
 
 // ============= GET DASHBOARD INFO =============
 app.get('/api/dashboard', authenticateToken, (req, res) => {
-  const user = db.prepare(`SELECT id, email, name, plan, max_optimizations, optimizations_used,
-                                  (max_optimizations - optimizations_used) as remaining_optimizations 
-                           FROM users WHERE id = ?`).get(req.user.userId);
-  
-  if (!user) {
-    return res.status(404).json({ error: 'User not found' });
-  }
-  console.log(`📊 Dashboard data for user ${user.id}:`, { name: user.name, email: user.email });
-  res.json(user);
+  db.get(`SELECT id, email, name, plan, max_optimizations, optimizations_used,
+                 (max_optimizations - optimizations_used) as remaining_optimizations 
+          FROM users WHERE id = ?`, [req.user.userId], (err, user) => {
+    if (err || !user) return res.status(404).json({ error: 'User not found' });
+    res.json(user);
+  });
 });
 
-// ============= GET OPTIMIZATION HISTORY =============
+// ============= GET HISTORY =============
 app.get('/api/history', authenticateToken, (req, res) => {
-  const rows = db.prepare(`SELECT id, job_description, optimized_resume, match_score, created_at 
-                           FROM optimization_history 
-                           WHERE user_id = ? 
-                           ORDER BY created_at DESC 
-                           LIMIT 50`).all(req.user.userId);
-  res.json(rows || []);
+  db.all(`SELECT id, job_description, optimized_resume, match_score, created_at 
+          FROM optimization_history WHERE user_id = ? ORDER BY created_at DESC LIMIT 50`,
+    [req.user.userId], (err, rows) => {
+    res.json(rows || []);
+  });
 });
 
-// ============= DELETE SINGLE HISTORY ITEM =============
+// ============= DELETE HISTORY =============
 app.delete('/api/history/:id', authenticateToken, (req, res) => {
   const { id } = req.params;
   const userId = req.user.userId;
   
-  const historyItem = db.prepare(`SELECT user_id FROM optimization_history WHERE id = ?`).get(id);
-  
-  if (!historyItem) {
-    return res.status(404).json({ error: 'History item not found' });
-  }
-  
-  if (historyItem.user_id !== userId) {
-    return res.status(403).json({ error: 'Unauthorized' });
-  }
-  
-  db.prepare(`DELETE FROM optimization_history WHERE id = ?`).run(id);
-  res.json({ success: true });
+  db.get(`SELECT user_id FROM optimization_history WHERE id = ?`, [id], (err, row) => {
+    if (err || !row) return res.status(404).json({ error: 'Not found' });
+    if (row.user_id !== userId) return res.status(403).json({ error: 'Unauthorized' });
+    
+    db.run(`DELETE FROM optimization_history WHERE id = ?`, [id]);
+    res.json({ success: true });
+  });
 });
 
-// ============= DELETE ALL HISTORY FOR USER =============
 app.delete('/api/history', authenticateToken, (req, res) => {
-  const userId = req.user.userId;
-  db.prepare(`DELETE FROM optimization_history WHERE user_id = ?`).run(userId);
+  db.run(`DELETE FROM optimization_history WHERE user_id = ?`, [req.user.userId]);
   res.json({ success: true });
 });
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`========================================`);
-  console.log(`✅ Server Running`);
-  console.log(`   Port: ${PORT}`);
+  console.log(`✅ Server Running on port ${PORT}`);
   console.log(`   Claude API: ${process.env.CLAUDE_API_KEY ? '✅ Loaded' : '❌ Missing'}`);
-  console.log(`   Demo user: demo@airesumerefine.com (TOP plan - 30 optimizations)`);
-  console.log(`   Test endpoint: http://localhost:${PORT}/api/test-claude`);
-  console.log(`========================================`);
-  console.log(`📊 Plan Limits:`);
-  console.log(`   Basic: 10 optimizations`);
-  console.log(`   Advance: 20 optimizations`);
-  console.log(`   Top: 30 optimizations`);
+  console.log(`   Demo user: demo@airesumerefine.com`);
   console.log(`========================================`);
 });
