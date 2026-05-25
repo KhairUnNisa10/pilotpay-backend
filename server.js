@@ -219,12 +219,12 @@ db.serialize(() => {
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )`);
   
-  // Add columns if needed
+  // Add columns if needed (safe to keep - they won't error if columns exist)
   db.run(`ALTER TABLE users ADD COLUMN name TEXT DEFAULT ''`, () => {});
   db.run(`ALTER TABLE users ADD COLUMN max_optimizations INTEGER DEFAULT 10`, () => {});
   db.run(`ALTER TABLE users ADD COLUMN optimizations_used INTEGER DEFAULT 0`, () => {});
   
-  // Update existing users
+  // Update existing users based on plan
   db.run(`UPDATE users SET max_optimizations = 10 WHERE plan = 'basic' AND (max_optimizations IS NULL OR max_optimizations = 0)`);
   db.run(`UPDATE users SET max_optimizations = 20 WHERE plan = 'advance' AND (max_optimizations IS NULL OR max_optimizations = 0)`);
   db.run(`UPDATE users SET max_optimizations = 30 WHERE plan = 'top' AND (max_optimizations IS NULL OR max_optimizations = 0)`);
@@ -240,7 +240,7 @@ db.serialize(() => {
   });
 });
 
-// Add a root route for testing
+// Root route
 app.get('/', (req, res) => {
   res.send('✅ Resume Refiner Backend is running');
 });
@@ -313,15 +313,18 @@ app.get('/api/test-claude', async (req, res) => {
 // ============= DEMO LOGIN =============
 app.post('/api/demo-login', async (req, res) => {
   try {
+    const email = req.query.email || req.body.email || 'demo@airesumerefine.com';
+    
     db.get(`SELECT id, email, name, plan, max_optimizations, optimizations_used,
                    (max_optimizations - optimizations_used) as remaining_optimizations 
-            FROM users WHERE email = 'demo@airesumerefine.com'`, (err, user) => {
+            FROM users WHERE email = ?`, [email], (err, user) => {
       if (err || !user) {
         return res.status(500).json({ error: 'Demo user not found' });
       }
       
       const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET);
       
+      // Return camelCase for frontend
       res.json({ 
         success: true, 
         token, 
@@ -340,6 +343,53 @@ app.post('/api/demo-login', async (req, res) => {
     console.error('Demo login error:', error);
     res.status(500).json({ error: 'Demo login failed' });
   }
+});
+
+// ============= LOGIN ENDPOINT =============
+app.post('/api/login', (req, res) => {
+  const { email, password } = req.body;
+  
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Email and password required' });
+  }
+  
+  db.get(`SELECT id, email, name, plan, max_optimizations, optimizations_used,
+                 (max_optimizations - optimizations_used) as remaining_optimizations,
+                 password_hash 
+          FROM users WHERE email = ?`, [email], async (err, user) => {
+    
+    if (err || !user) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+    
+    let valid = false;
+    if (user.password_hash === 'demo_hash') {
+      valid = (password === 'demo123');
+    } else {
+      valid = await bcrypt.compare(password, user.password_hash);
+    }
+    
+    if (!valid) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+    
+    const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET);
+    
+    // Return camelCase for frontend
+    res.json({
+      success: true,
+      token,
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name || '',
+        plan: user.plan,
+        maxOptimizations: user.max_optimizations,
+        optimizationsUsed: user.optimizations_used,
+        remainingOptimizations: user.remaining_optimizations
+      }
+    });
+  });
 });
 
 // ============= UPDATE USER PROFILE =============
@@ -365,11 +415,15 @@ app.put('/api/user/password', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'User not found' });
     }
     
-    if (user.password_hash !== 'demo_hash') {
-      const valid = await bcrypt.compare(currentPassword, user.password_hash);
-      if (!valid) {
-        return res.status(401).json({ error: 'Current password is incorrect' });
-      }
+    let valid = false;
+    if (user.password_hash === 'demo_hash') {
+      valid = (currentPassword === 'demo123');
+    } else {
+      valid = await bcrypt.compare(currentPassword, user.password_hash);
+    }
+    
+    if (!valid) {
+      return res.status(401).json({ error: 'Current password is incorrect' });
     }
     
     const hashedPassword = await bcrypt.hash(newPassword, 10);
@@ -463,12 +517,23 @@ app.post('/api/optimize-resume', authenticateToken, async (req, res) => {
 });
 
 // ============= GET DASHBOARD INFO =============
+// ============= GET DASHBOARD INFO =============
 app.get('/api/dashboard', authenticateToken, (req, res) => {
   db.get(`SELECT id, email, name, plan, max_optimizations, optimizations_used,
                  (max_optimizations - optimizations_used) as remaining_optimizations 
           FROM users WHERE id = ?`, [req.user.userId], (err, user) => {
     if (err || !user) return res.status(404).json({ error: 'User not found' });
-    res.json(user);
+    
+    // Convert snake_case to camelCase for frontend
+    res.json({
+      id: user.id,
+      email: user.email,
+      name: user.name || '',
+      plan: user.plan,
+      maxOptimizations: user.max_optimizations,
+      optimizationsUsed: user.optimizations_used,
+      remainingOptimizations: user.remaining_optimizations
+    });
   });
 });
 
@@ -498,6 +563,227 @@ app.delete('/api/history/:id', authenticateToken, (req, res) => {
 app.delete('/api/history', authenticateToken, (req, res) => {
   db.run(`DELETE FROM optimization_history WHERE user_id = ?`, [req.user.userId]);
   res.json({ success: true });
+});
+
+// ============= FORGOT PASSWORD =============
+// Store reset tokens temporarily
+const resetTokens = new Map();
+
+app.post('/api/forgot-password', async (req, res) => {
+  const { email } = req.body;
+  
+  if (!email) {
+    return res.status(400).json({ error: 'Email is required' });
+  }
+  
+  db.get(`SELECT id, email FROM users WHERE email = ?`, [email], async (err, user) => {
+    if (err || !user) {
+      // For security, don't reveal if email exists or not
+      return res.json({ success: true, message: 'If your email exists in our system, you will receive a reset link.' });
+    }
+    
+    // Generate reset token
+    const resetToken = crypto.randomBytes(32).toString('hex');
+    const expiresAt = Date.now() + 3600000; // 1 hour
+    
+    resetTokens.set(resetToken, {
+      userId: user.id,
+      email: user.email,
+      expiresAt: expiresAt
+    });
+    
+    // In production, send actual email
+    // For now, log the reset link
+    const resetLink = `https://pilotpay-backend.onrender.com/reset-password?token=${resetToken}`;
+    console.log(`🔐 Password reset link for ${email}: ${resetLink}`);
+    
+    // TODO: Send email with reset link
+    // await sendEmail(email, 'Password Reset', `Click here to reset: ${resetLink}`);
+    
+    res.json({ 
+      success: true, 
+      message: 'If your email exists in our system, you will receive a reset link.',
+      // Remove this in production - only for testing
+      devLink: resetLink 
+    });
+  });
+});
+
+// ============= RESET PASSWORD WITH TOKEN =============
+app.post('/api/reset-password', async (req, res) => {
+  const { token, newPassword } = req.body;
+  
+  if (!token || !newPassword) {
+    return res.status(400).json({ error: 'Token and new password required' });
+  }
+  
+  const resetData = resetTokens.get(token);
+  
+  if (!resetData) {
+    return res.status(400).json({ error: 'Invalid or expired reset token' });
+  }
+  
+  if (Date.now() > resetData.expiresAt) {
+    resetTokens.delete(token);
+    return res.status(400).json({ error: 'Reset token has expired' });
+  }
+  
+  const hashedPassword = await bcrypt.hash(newPassword, 10);
+  
+  db.run(`UPDATE users SET password_hash = ? WHERE id = ?`, [hashedPassword, resetData.userId], function(err) {
+    if (err) {
+      return res.status(500).json({ error: 'Failed to reset password' });
+    }
+    
+    resetTokens.delete(token);
+    res.json({ success: true, message: 'Password reset successfully' });
+  });
+});
+
+// ============= CREATE DEMO USERS =============
+app.get('/api/setup-demo-users', async (req, res) => {
+  const demoUsers = [
+    {
+      email: 'demo01@airesumerefine.com',
+      name: 'Demo User Basic',
+      plan: 'basic',
+      max_optimizations: 10,
+      password: 'demo123'
+    },
+    {
+      email: 'demo02@airesumerefine.com',
+      name: 'Demo User Advance',
+      plan: 'advance',
+      max_optimizations: 20,
+      password: 'demo123'
+    },
+    {
+      email: 'demo03@airesumerefine.com',
+      name: 'Demo User Top',
+      plan: 'top',
+      max_optimizations: 30,
+      password: 'demo123'
+    }
+  ];
+  
+  let results = [];
+  
+  for (const user of demoUsers) {
+    const hashedPassword = await bcrypt.hash(user.password, 10);
+    
+    // Check if user already exists
+    const existing = await new Promise((resolve) => {
+      db.get(`SELECT id FROM users WHERE email = ?`, [user.email], (err, row) => resolve(row));
+    });
+    
+    if (!existing) {
+      await new Promise((resolve) => {
+        db.run(
+          `INSERT INTO users (email, name, password_hash, plan, max_optimizations, optimizations_used) 
+           VALUES (?, ?, ?, ?, ?, ?)`,
+          [user.email, user.name, hashedPassword, user.plan, user.max_optimizations, 0],
+          (err) => resolve(err)
+        );
+      });
+      results.push({ ...user, status: 'created' });
+    } else {
+      // Update existing user
+      await new Promise((resolve) => {
+        db.run(
+          `UPDATE users SET name = ?, plan = ?, max_optimizations = ? WHERE email = ?`,
+          [user.name, user.plan, user.max_optimizations, user.email],
+          (err) => resolve(err)
+        );
+      });
+      results.push({ ...user, status: 'updated' });
+    }
+  }
+  
+  res.json({
+    success: true,
+    message: 'Demo users created/updated successfully',
+    users: results.map(u => ({
+      email: u.email,
+      plan: u.plan,
+      optimizations: u.max_optimizations,
+      password: u.password,
+      status: u.status
+    }))
+  });
+});
+
+// TEMPORARY - Check demo users
+app.get('/api/check-demo-users', (req, res) => {
+  db.all(`SELECT email, plan, max_optimizations, optimizations_used FROM users WHERE email LIKE 'demo%'`, [], (err, users) => {
+    if (err) {
+      res.json({ error: err.message });
+    } else {
+      res.json({ users });
+    }
+  });
+});
+
+// ============= TEST MODE - SIMULATE PAYMENT SUCCESS =============
+app.post('/api/test-payment-success', async (req, res) => {
+    const { email, firstName, lastName, plan, maxOptimizations, features } = req.body;
+    
+    console.log('🎯 TEST MODE: Creating account for:', { email, plan, maxOptimizations });
+    
+    if (!email || !plan) {
+        return res.status(400).json({ error: 'Email and plan required' });
+    }
+    
+    try {
+        // Check if user already exists
+        const existingUser = await new Promise((resolve) => {
+            db.get(`SELECT id FROM users WHERE email = ?`, [email], (err, row) => resolve(row));
+        });
+        
+        if (existingUser) {
+            return res.status(400).json({ error: 'User already exists with this email' });
+        }
+        
+        // Generate random password
+        const generateRandomPassword = () => {
+            const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%';
+            let password = '';
+            for (let i = 0; i < 10; i++) {
+                password += chars.charAt(Math.floor(Math.random() * chars.length));
+            }
+            return password;
+        };
+        
+        const temporaryPassword = generateRandomPassword();
+        const hashedPassword = await bcrypt.hash(temporaryPassword, 10);
+        const name = `${firstName || ''} ${lastName || ''}`.trim() || email.split('@')[0];
+        
+        // Create user
+        await new Promise((resolve) => {
+            db.run(
+                `INSERT INTO users (email, name, password_hash, plan, max_optimizations, optimizations_used) 
+                 VALUES (?, ?, ?, ?, ?, ?)`,
+                [email, name, hashedPassword, plan.toLowerCase(), maxOptimizations, 0],
+                (err) => resolve(err)
+            );
+        });
+        
+        console.log('✅ Test user created:', email);
+        console.log('📧 Temporary password:', temporaryPassword);
+        
+        // For testing, send back the credentials (in production, send via email)
+        res.json({
+            success: true,
+            message: 'Account created successfully',
+            credentials: {
+                email: email,
+                password: temporaryPassword
+            }
+        });
+        
+    } catch (error) {
+        console.error('Error creating test user:', error);
+        res.status(500).json({ error: 'Failed to create account' });
+    }
 });
 
 const PORT = process.env.PORT || 5000;
